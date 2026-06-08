@@ -1,7 +1,7 @@
 
 ### 1. Base64 Encoding
 
-![[Pasted image 20260602155527.png]]
+![](image1.png)
 
 
 dXNlcm5hbWUxOmFkbWlu
