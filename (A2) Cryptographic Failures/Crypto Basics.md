@@ -1,7 +1,7 @@
 
 ### 1. Base64 Encoding
 
-![](image1.png)
+![](images/image1.png)
 
 
 dXNlcm5hbWUxOmFkbWlu
